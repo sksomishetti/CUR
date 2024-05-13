@@ -1,0 +1,191 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation stack to manage AWS Cost and Usage Report (CUR) and trigger cost allocation tag backfill process.
+Parameters:
+  BucketName:
+    Type: String
+    Description: The name of the S3 bucket to store the AWS Cost and Usage Report
+Resources:
+  MyCURReportBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      AccessControl: BucketOwnerFullControl
+      VersioningConfiguration:
+        Status: Suspended
+  CURReportBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MyCURReportBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowBillingReportsServiceReadBucket
+            Effect: Allow
+            Principal:
+              Service: billingreports.amazonaws.com
+            Action:
+              - s3:GetBucketAcl
+              - s3:GetBucketPolicy
+            Resource: !GetAtt MyCURReportBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub arn:aws:cur:${AWS::Region}:${AWS::AccountId}:definition/*
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: AllowBillingReportsServiceWriteObjects
+            Effect: Allow
+            Principal:
+              Service: billingreports.amazonaws.com
+            Action:
+              - s3:PutObject
+            Resource: !Sub ${MyCURReportBucket.Arn}/*
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub arn:aws:cur:${AWS::Region}:${AWS::AccountId}:definition/*
+                aws:SourceAccount: !Ref AWS::AccountId
+    DependsOn: MyCURReportBucket
+  CURReport:
+    Type: AWS::CUR::ReportDefinition
+    DependsOn: CURReportBucketPolicy
+    Properties:
+      ReportName: aws-usage-report
+      TimeUnit: HOURLY
+      Format: textORcsv
+      Compression: GZIP
+      AdditionalSchemaElements:
+        - RESOURCES
+      S3Bucket: !Ref MyCURReportBucket
+      S3Region: us-east-1
+      S3Prefix: billing
+      RefreshClosedReports: true
+      ReportVersioning: CREATE_NEW_REPORT
+  CostAllocationTagBackfillFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: CURReport
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import cfnresponse
+          import datetime
+          import subprocess
+          import sys
+          from pip._internal import main
+          main(['install', '-I', '-q', 'boto3', '--target', '/tmp/', '--no-cache-dir', '--disable-pip-version-check'])
+          sys.path.insert(0, '/tmp/')
+          import boto3
+          from botocore.exceptions import ClientError
+
+          def activate_cost_tag(ce_client):
+            # Define the tag key and status
+            tag_keys=ce_client.list_cost_allocation_tags(
+              Status='Inactive',
+              Type='AWSGenerated',
+              MaxResults=1
+            )
+            print(f"Keys: {tag_keys}")
+            tag_key=tag_keys['CostAllocationTags'][0]['TagKey']
+            tag_status='Active'
+            # Update the cost allocation tag status
+            resp=ce_client.update_cost_allocation_tags_status(
+                CostAllocationTagsStatus=[
+                    {
+                        'TagKey': tag_key,
+                        'Status': tag_status
+                    }
+                ]
+              )
+            return
+
+          def request_backfill(ce_client):
+            try:
+              # Calculate the first day of the current month 12 months ago
+              current_date = datetime.datetime.utcnow()
+              print(f"current_date: {current_date}")
+              first_day_of_current_month = current_date.replace(day=1)
+              first_day_of_previous_year = first_day_of_current_month - datetime.timedelta(days=365)
+              backfill_from = first_day_of_previous_year.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+              print(f"Backfill_From: {backfill_from}")
+              # Start the cost allocation tag backfill
+              response = ce_client.start_cost_allocation_tag_backfill(
+                BackfillFrom=backfill_from.strftime("%Y-%m-%dT%H:%M:%SZ"))
+              return response
+            except ClientError as e:
+              print(f"Error executing AWS command: {e}")
+              if e.response['Error']['Message'] == "Failed to start Cost Allocation Tag backfill: no cost allocation tag statuses have been modified":
+                print(e.response['Error']['Message'])
+                activate_cost_tag(ce_client)
+                request_backfill(ce_client)
+              else:
+                return e.response
+
+          def lambda_handler(event, context):
+              print(f"Event: {event}")
+              print(f"boto3-version: {boto3.__version__}")
+              if event['RequestType'] == 'Delete':
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                return
+              try:
+                # Create a Cost Explorer client
+                ce_client = boto3.client('ce')
+                response = request_backfill(ce_client)
+                try:
+                  cfnresponse.send(
+                    event,
+                    context,
+                    cfnresponse.FAILED,
+                    {},
+                    reason="ERROR: {}".format(response['Error']['Message'])
+                  )
+                  return
+                except Exception:
+                  pass
+                formatted_response=json.dumps({"Response": str(response)}, indent=4)
+                print(f"Formatted Response: {formatted_response}")
+
+                # Send a success response to CloudFormation
+                responseData = {}
+                responseData['response'] = formatted_response
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+
+              except Exception as e:
+                  print(f"Unexpected Error: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+      Runtime: python3.8
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - ce:StartCostAllocationTagBackfill
+                  - ce:UpdateCostAllocationTagsStatus
+                  - ce:ListCostAllocationTags
+                Resource: '*'
+  BackfillCustomResource:
+    Type: Custom::CostAllocationTagBackfill
+    Properties:
+      ServiceToken: !GetAtt CostAllocationTagBackfillFunction.Arn
+Outputs:
+  BackfillRequestResponse:
+    Description: Backfill request response
+    Value: !GetAtt BackfillCustomResource.response

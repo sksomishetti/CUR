@@ -1,0 +1,225 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  CloudFormation stack to create a Lambda function, IAM roles, and policies. 
+  Please deploy this in US-EAST-1.
+Parameters:
+  SourceBucketNames:
+    Type: CommaDelimitedList
+    Description: List of source bucket names
+    Default: s1,s2,s3
+  TargetBucketName:
+    Type: String
+    Description: Name of the target bucket. Please replace MPAID with real MPAID of customer.
+    Default: doitintl-awsops-MPAID
+Resources:
+  # IAM Role for Lambda execution
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      MaxSessionDuration: 3600
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - lambda:InvokeFunction
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                  - iam:CreatePolicy
+                  - iam:AttachRolePolicy
+                  - iam:GetRole
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - !Sub arn:aws:s3:::${TargetBucketName}
+                  - !Sub arn:aws:s3:::${TargetBucketName}/*
+
+  # Lambda function to copy objects from source buckets to target bucket
+  FolderCopyLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          LambdaExecutionRoleArn: !GetAtt LambdaExecutionRole.Arn
+          SourceBucketNames: !Join
+            - ','
+            - !Ref SourceBucketNames
+          TargetBucketName: !Ref TargetBucketName
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+
+          # Initialize the S3 client
+          s3_client = boto3.client('s3')
+
+          def lambda_handler(event, context):
+              # Extract source and target bucket names from the environment variables
+              source_buckets = os.environ['SourceBucketNames'].split(',')
+              target_bucket = os.environ['TargetBucketName']
+
+              for index, source_bucket in enumerate(source_buckets, start=1):
+                  # Generate a unique target path suffix for each source bucket
+                  target_path_suffix = f"CUR/{target_bucket}/backfill/backfill-{index}"
+
+                  # Initialize the paginator for listing objects
+                  paginator = s3_client.get_paginator('list_objects_v2')
+                  page_iterator = paginator.paginate(Bucket=source_bucket, Prefix='billing/aws-usage-report/')
+
+                  # Loop through pages of objects
+                  for page in page_iterator:
+                      if 'Contents' in page:
+                          for obj in page['Contents']:
+                              copy_source = {'Bucket': source_bucket, 'Key': obj['Key']}
+                              # Ensure the source bucket's name is not included in the target key
+                              target_key = f"{target_path_suffix}/{obj['Key'][len('billing/aws-usage-report/'):]}"
+                              # Copy the object to the target bucket with the generated target key
+                              s3_client.copy_object(CopySource=copy_source, Bucket=target_bucket, Key=target_key)
+                              print(f"Copied {obj['Key']} from {source_bucket} to {target_bucket}/{target_key}")
+
+              return {
+                  'statusCode': 200,
+                  'body': 'Copy operation completed successfully.'
+              }
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.8
+      Timeout: 900
+
+  # Lambda function to generate bucket policies and lambda policy
+  GeneratePolicyLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.8
+      Timeout: 300
+      Environment:
+        Variables:
+          LambdaExecutionRoleArn: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import cfnresponse
+          def handler(event, context):
+              print(event)
+              if event['RequestType'] == 'Delete':
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              # Get the ARN of the Lambda execution role from environment variable
+              lambda_execution_role_arn = os.environ['LambdaExecutionRoleArn']
+              # Split the comma-delimited string into a list of bucket names
+              source_buckets = event['ResourceProperties'].get('SourceBucketNames', [])
+              target_bucket = event['ResourceProperties'].get('TargetBucketName', '')
+              source_bucket_resource = []
+              for source_bucket in source_buckets:
+                  source_bucket_resource.append(f"arn:aws:s3:::{source_bucket}/*")
+                  source_bucket_resource.append(f"arn:aws:s3:::{source_bucket}")
+              bucket_policies = []
+              for source_bucket in source_buckets:
+                  bucket_policy = {
+                      "Version": "2012-10-17",
+                      "Statement": [
+                          {
+                              "Sid": "LambdaAccess",
+                              "Effect": "Allow",
+                              "Principal": {
+                                  "AWS": lambda_execution_role_arn
+                              },
+                              "Action": ["s3:GetObject", "s3:ListBucket"],
+                              "Resource": [
+                                  f"arn:aws:s3:::{source_bucket}/*",
+                                  f"arn:aws:s3:::{source_bucket}"
+                              ]
+                          }
+                      ]
+                  }
+                  bucket_policies.append(bucket_policy)
+              # Format the bucket policies JSON
+              formatted_bucket_policies = json.dumps(bucket_policies, indent=4)
+              lambda_policy = {
+                "Version": "2012-10-17",
+                "Statement": [
+                  {
+                    "Sid": "AllowS3ReadSource",
+                    "Effect": "Allow",
+                    "Action": [
+                      "s3:ListBucket",
+                      "s3:GetObject",
+                      "s3:GetObjectTagging"
+                    ],
+                    "Resource": source_bucket_resource
+                  }
+                ]
+              }
+              print(lambda_policy)
+              # Format the lambda policy JSON
+              formatted_lambda_policy = json.dumps(lambda_policy, indent=4)
+              # Save the formatted bucket policies into the target S3 bucket
+              s3_client = boto3.client('s3')
+              s3_client.put_object(
+                  Bucket=target_bucket,
+                  Key='bucket_policies.json',
+                  Body=formatted_bucket_policies
+              )
+              # Return success status and bucket policies
+              responseData = {}
+              responseData['formatted_bucket_policies'] = formatted_bucket_policies
+              responseData['formatted_lambda_policy'] = formatted_lambda_policy
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              return {
+                  "Success": True
+              }
+  GeneratePolicies:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt GeneratePolicyLambdaFunction.Arn
+      SourceBucketNames: !Ref SourceBucketNames
+      TargetBucketName: !Ref TargetBucketName
+
+  # IAM Managed Policy for Lambda execution role
+  LambdaSourceBucketPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - !Ref LambdaExecutionRole
+      PolicyDocument: !GetAtt GeneratePolicies.formatted_lambda_policy
+
+  # Lambda permission to invoke the Lambda function
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt FolderCopyLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledEvent.Arn
+
+  # Scheduled event to trigger the Lambda function
+  ScheduledEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(15 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt FolderCopyLambdaFunction.Arn
+          Id: InvokeFolderCopyLambda
+
+Outputs:
+  CustomerBucketPolicy:
+    Description: Bucket policy/policies to be provided for customer
+    Value: !GetAtt GeneratePolicies.formatted_bucket_policies
